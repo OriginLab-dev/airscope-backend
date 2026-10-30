@@ -107,10 +107,51 @@ app.get('/api/cities', async (_request, response) => {
   }
 });
 
-app.get('/api/air-quality', (_request, response) => {
-  response.status(501).json({
-    message: 'The air-quality read API response design has not been approved yet.',
-  });
+app.get('/api/air-quality', async (request, response) => {
+  if (!database) {
+    response.status(503).json({ message: 'Database connection is not configured.' });
+    return;
+  }
+
+  const city = typeof request.query.city === 'string' ? request.query.city.trim() : '';
+  const requestedLimit = request.query.limit === undefined ? 24 : Number(request.query.limit);
+
+  if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
+    response.status(400).json({
+      message: 'limit must be a whole number from 1 to 100.',
+    });
+    return;
+  }
+
+  try {
+    const [rows] = await database.query(
+      `SELECT
+         c.name AS city,
+         r.recorded_at AS recordedAt,
+         r.aqi,
+         r.pm25,
+         r.pm10,
+         r.no2,
+         r.so2,
+         r.co,
+         r.o3,
+         r.source
+       FROM air_quality_readings AS r
+       INNER JOIN cities AS c ON c.id = r.city_id
+       WHERE (? = '' OR c.name = ?)
+       ORDER BY r.recorded_at DESC, c.name
+       LIMIT ?`,
+      [city, city, requestedLimit],
+    );
+
+    response.status(200).json({
+      readings: rows,
+      count: rows.length,
+    });
+  } catch (error) {
+    console.error('Failed to retrieve air-quality readings:', error.message);
+    response.status(503).json({ message: 'Database is unavailable.' });
+  }
 });
 
 async function startServer() {
