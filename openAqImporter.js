@@ -1,3 +1,4 @@
+const { calculateAqi } = require('./aqi');
 const MONITORED_LOCATIONS = [
   { city: 'Kolkata', locationId: 10633, station: 'Victoria, Kolkata - WBPCB' },
   { city: 'Howrah', locationId: 5614, station: 'Padmapukur, Howrah - WBPCB' },
@@ -5,7 +6,7 @@ const MONITORED_LOCATIONS = [
 ];
 
 const SUPPORTED_PARAMETERS = new Set(['pm25', 'pm10', 'no2', 'so2', 'co', 'o3']);
-const MAX_MEASUREMENT_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_MEASUREMENT_AGE_MS = 48 * 60 * 60 * 1000;
 const PPB_TO_MICROGRAMS_PER_CUBIC_METER = {
   co: 1.1456,
   no2: 1.8816,
@@ -19,8 +20,9 @@ function utcHour(dateTime) {
 }
 
 function normalizeValue(value, parameter, units) {
-  if (!Number.isFinite(Number(value))) return null;
+  if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) || Number(value) < 0) return null;
   if (units === 'µg/m³') return Number(value);
+  if (units === 'mg/m³') return Number(value) * 1000;
   if (units === 'ppb' && PPB_TO_MICROGRAMS_PER_CUBIC_METER[parameter]) {
     return Number(value) * PPB_TO_MICROGRAMS_PER_CUBIC_METER[parameter];
   }
@@ -30,6 +32,7 @@ function normalizeValue(value, parameter, units) {
 async function openAqRequest(path, apiKey) {
   const response = await fetch(`https://api.openaq.org/v3${path}`, {
     headers: { 'X-API-Key': apiKey },
+    signal: AbortSignal.timeout(30000),
   });
 
   if (!response.ok) {
@@ -40,37 +43,34 @@ async function openAqRequest(path, apiKey) {
 }
 
 async function getHourlyReadings(location, apiKey) {
-  const [latestResponse, sensorsResponse] = await Promise.all([
-    openAqRequest(`/locations/${location.locationId}/latest`, apiKey),
-    openAqRequest(`/locations/${location.locationId}/sensors?limit=100`, apiKey),
-  ]);
-
-  const sensors = new Map(
-    (sensorsResponse.results || []).map((sensor) => [sensor.id, sensor.parameter]),
-  );
+  const sensorsResponse = await openAqRequest(`/locations/${location.locationId}/sensors?limit=100`, apiKey);
+  const now = Date.now();
+  const from = now - MAX_MEASUREMENT_AGE_MS;
+  // Choose the most recently reporting sensor per pollutant at the approved station.
+  const sensors = new Map();
+  for (const sensor of sensorsResponse.results || []) {
+    const key = sensor.parameter?.name;
+    const last = Date.parse(sensor.datetimeLast?.utc);
+    if (!SUPPORTED_PARAMETERS.has(key) || !Number.isFinite(last) || last < from) continue;
+    if (!sensors.has(key) || last > Date.parse(sensors.get(key).datetimeLast.utc)) sensors.set(key, sensor);
+  }
   const readingsByHour = new Map();
-
-  for (const measurement of latestResponse.results || []) {
-    const parameterDetails = sensors.get(measurement.sensorsId);
-    const parameter = parameterDetails?.name;
-    const timestamp = measurement.datetime?.utc;
-    const measurementTime = new Date(timestamp).getTime();
-
-    if (!SUPPORTED_PARAMETERS.has(parameter) || !timestamp) continue;
-    if (!Number.isFinite(measurementTime) || Date.now() - measurementTime > MAX_MEASUREMENT_AGE_MS) {
-      continue;
+  for (const [parameter, sensor] of sensors) {
+    const query = new URLSearchParams({ datetime_from:new Date(from).toISOString(), datetime_to:new Date(now).toISOString(), limit:'100' });
+    const result = await openAqRequest(`/sensors/${sensor.id}/hours?${query}`, apiKey);
+    for (const measurement of result.results || []) {
+      const timestamp = measurement.period?.datetimeTo?.utc;
+      const measurementTime = Date.parse(timestamp);
+      if (!Number.isFinite(measurementTime) || measurementTime <= from || measurementTime > now || measurement.flagInfo?.hasFlags) continue;
+      if (measurement.coverage?.percentCoverage != null && measurement.coverage.percentCoverage < 75) continue;
+      const value = normalizeValue(measurement.value, parameter, measurement.parameter?.units || sensor.parameter.units);
+      if (value === null) continue;
+      // Preserve the actual hour's end (Indian stations often report at :30 UTC).
+      const recordedAt = new Date(measurementTime).toISOString().slice(0,19).replace('T',' ');
+      const reading = readingsByHour.get(recordedAt) || { recordedAt, source:`OpenAQ: ${location.station} · hourly mean` };
+      reading[parameter] = value;
+      readingsByHour.set(recordedAt, reading);
     }
-
-    const value = normalizeValue(measurement.value, parameter, parameterDetails.units);
-    if (value === null) continue;
-
-    const recordedAt = utcHour(timestamp);
-    const reading = readingsByHour.get(recordedAt) || {
-      recordedAt,
-      source: `OpenAQ: ${location.station}`,
-    };
-    reading[parameter] = value;
-    readingsByHour.set(recordedAt, reading);
   }
 
   return [...readingsByHour.values()];
@@ -124,6 +124,7 @@ async function importOpenAqReadings({ database, apiKey }) {
         );
         imported += 1;
       }
+      await refreshStoredAqi(database, cityId, location.city);
     } catch (error) {
       console.error(`OpenAQ import failed for ${location.city}:`, error.message);
       failures += 1;
@@ -131,6 +132,27 @@ async function importOpenAqReadings({ database, apiKey }) {
   }
 
   return { imported, failures };
+}
+
+async function refreshStoredAqi(database, cityId, city) {
+  const [history] = await database.query(
+    `SELECT recorded_at AS recordedAt, source, pm25, pm10, no2, so2, co, o3
+     FROM air_quality_readings WHERE city_id = ?
+       AND recorded_at >= UTC_TIMESTAMP() - INTERVAL 72 HOUR
+     ORDER BY recorded_at`, [cityId],
+  );
+  const rows = history.map(row => ({ ...row, city }));
+  let updated = 0;
+  for (const row of rows) {
+    if (!row.source?.endsWith(' · hourly mean')) continue;
+    const result = calculateAqi(row, rows);
+    await database.query(
+      'UPDATE air_quality_readings SET aqi = ? WHERE city_id = ? AND recorded_at = ? AND source = ?',
+      [result.aqi, cityId, row.recordedAt, row.source],
+    );
+    if (result.aqi !== null) updated += 1;
+  }
+  return updated;
 }
 
 function startOpenAqImporter({ database, apiKey, intervalMs = 60 * 60 * 1000 }) {
@@ -159,4 +181,4 @@ function startOpenAqImporter({ database, apiKey, intervalMs = 60 * 60 * 1000 }) 
   return () => clearTimeout(retryTimer);
 }
 
-module.exports = { importOpenAqReadings, startOpenAqImporter };
+module.exports = { importOpenAqReadings, startOpenAqImporter, normalizeValue, getHourlyReadings, refreshStoredAqi };

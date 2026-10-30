@@ -1,4 +1,6 @@
 const express = require('express');
+const { calculateAqi } = require('./aqi');
+const cors = require('cors');
 const dns = require('node:dns/promises');
 const net = require('node:net');
 const mysql = require('mysql2/promise');
@@ -6,6 +8,10 @@ const { startOpenAqImporter } = require('./openAqImporter');
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
+const allowedOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 const databaseConfigured = Boolean(
   process.env.DB_HOST &&
@@ -63,6 +69,14 @@ async function connectDatabase() {
 }
 
 app.use(express.json());
+app.use(cors({
+  origin(origin, callback) {
+    // Same-origin/server calls have no Origin header. Browser origins must be
+    // deliberately configured through CORS_ORIGIN on the deployment platform.
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origin is not allowed by CORS.'));
+  },
+}));
 
 const cities = [
   { id: 'kolkata', name: 'Kolkata' },
@@ -144,8 +158,21 @@ app.get('/api/air-quality', async (request, response) => {
       [city, city, requestedLimit],
     );
 
+    let history = [];
+    if (rows.length) {
+      const [historicalRows] = await database.query(
+        `SELECT c.name AS city, r.recorded_at AS recordedAt, r.source,
+                r.pm25, r.pm10, r.no2, r.so2, r.co, r.o3
+         FROM air_quality_readings r JOIN cities c ON c.id = r.city_id
+         WHERE (? = '' OR c.name = ?)
+           AND r.recorded_at >= DATE_SUB(?, INTERVAL 24 HOUR)
+           AND r.recorded_at <= ?`,
+        [city, city, rows[rows.length-1].recordedAt, rows[0].recordedAt],
+      );
+      history = historicalRows;
+    }
     response.status(200).json({
-      readings: rows,
+      readings: rows.map(row => ({ ...row, ...calculateAqi(row, history) })),
       count: rows.length,
     });
   } catch (error) {
